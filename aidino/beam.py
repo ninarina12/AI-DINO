@@ -198,6 +198,7 @@ class Beam:
         
         # Position relative to beam entry
         r = coords_lab - beam_center_lab.view(3, 1, 1, 1)
+        del coords_lab  # Free this immediately
         
         # Distance along beam direction
         depth = torch.sum(r * k_hat.view(3, 1, 1, 1), dim=0)  # [n1, n2, n3]
@@ -205,6 +206,7 @@ class Beam:
         # Transverse component (perpendicular to beam)
         r_parallel = depth.unsqueeze(0) * k_hat.view(3, 1, 1, 1)
         r_transverse = r - r_parallel  # [3, n1, n2, n3]
+        del r, r_parallel  # Free these immediately
         
         # Create orthonormal basis in transverse plane
         if torch.abs(k_hat[2]) < 0.9:
@@ -223,6 +225,7 @@ class Beam:
             torch.sum(r_transverse * u_transverse.view(3, 1, 1, 1), dim=0),
             torch.sum(r_transverse * v_transverse.view(3, 1, 1, 1), dim=0)
         ], dim=0)  # [2, n1, n2, n3]
+        del r_transverse  # Free this immediately
         
         # Calculate transverse profile (calls subclass-specific method)
         transverse_profile = self._calculate_transverse_profile(

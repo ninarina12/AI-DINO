@@ -226,7 +226,8 @@ class BraggCoherentDiffraction:
         supercell_size: Tuple
             Size of supercells (d1, d2, d3) in unit cells
         displacement_field: torch.Tensor
-            Tensor of shape [batch_size, n1, n2, n3, n_atoms, 3] containing the displacement field for each atom
+            Tensor of shape [batch_size, n1, n2, n3, n_atoms, 3] or [batch_size, n_sc1, n_sc2, n_sc3, n_atoms, 3]
+            containing the unique or supercell-averaged displacement field for each atom, respectively
         mask: torch.Tensor, optional
             Optional mask of shape [batch_size, n1, n2, n3] or [batch_size, n_sc1, n_sc2, n_sc3]
         q_batch_size: int, optional
@@ -271,12 +272,25 @@ class BraggCoherentDiffraction:
         # Calculate averaged displacements
         batch_size = displacement_field.shape[0]
         n_atoms = displacement_field.shape[-2]
-        
-        # Reshape to group unit cells into supercells: [batch_size, n_sc1, d1, n_sc2, d2, n_sc3, d3, n_atoms, 3]
-        grouped = displacement_field.view(batch_size, n_sc1, d1, n_sc2, d2, n_sc3, d3, n_atoms, 3)
-        
-        # Average over supercell dimensions (2, 4, 6) -> [n_sc1, n_sc2, n_sc3, n_atoms, 3]
-        avg_displacements = torch.mean(grouped, dim=(2, 4, 6))
+
+        # Check displacement field dimensions and convert to supercell level if needed
+        if displacement_field.shape[-5:-2] == (n1, n2, n3):
+            # Displacement field is at unit cell resolution - need to downsample to supercell resolution
+            # Reshape to group unit cells into supercells: [batch_size, n_sc1, d1, n_sc2, d2, n_sc3, d3, n_atoms, 3]
+            grouped = displacement_field.view(batch_size, n_sc1, d1, n_sc2, d2, n_sc3, d3, n_atoms, 3)
+            
+            # Average over supercell dimensions (2, 4, 6) -> [n_sc1, n_sc2, n_sc3, n_atoms, 3]
+            avg_displacements = torch.mean(grouped, dim=(2, 4, 6))
+            
+        elif displacement_field.shape[-5:-2] == (n_sc1, n_sc2, n_sc3):
+            # Displacement field is already at supercell resolution
+            avg_displacements = displacement_field
+            
+        else:
+            raise ValueError(
+                f"Displacement field shape {displacement_field.shape[-5:-2]} is incompatible with crystal grid "
+                f"of size ({n1}, {n2}, {n3}) or supercell grid ({n_sc1}, {n_sc2}, {n_sc3})"
+            )
         
         # Flatten to [batch_size, n_supercells, n_atoms, 3]
         avg_displacements_flat = avg_displacements.view(batch_size, -1, n_atoms, 3)
