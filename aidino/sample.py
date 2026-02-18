@@ -976,3 +976,7 @@ class Crystal:
             self.shape_mask = self.original_shape_mask.clone()
         else:
             raise AttributeError("No original mask to reset to.")
+
+def load_displacement_npz(filename, dtype=torch.float32, device='cpu'):
+    data = np.load(filename)
+    return {k: torch.tensor(data[k], dtype=dtype, device=device) for k in data}
