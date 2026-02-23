@@ -719,10 +719,11 @@ class Crystal:
         axis = axis / torch.norm(axis)
         
         # Rodrigues' rotation formula
+        kx, ky, kz = axis[0].item(), axis[1].item(), axis[2].item() 
         K = torch.tensor([
-            [0, -axis[2], axis[1]],
-            [axis[2], 0, -axis[0]],
-            [-axis[1], axis[0], 0]
+            [0,   -kz,  ky],
+            [kz,    0, -kx],
+            [-ky,  kx,   0]
         ], dtype=self.dtype, device=self.device)
         
         I = torch.eye(3, dtype=self.dtype, device=self.device)
@@ -852,7 +853,7 @@ class Crystal:
         if rotation_matrix is None:
             if angles is None:
                 raise ValueError("Must provide either rotation_matrix or angles")
-            rotation_matrix = rotation_matrix_euler(*angles)
+            rotation_matrix = self.rotation_matrix_euler(*angles)
         else:
             rotation_matrix = rotation_matrix.to(self.device)
         

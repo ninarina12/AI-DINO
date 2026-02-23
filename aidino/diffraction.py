@@ -295,6 +295,9 @@ class BraggCoherentDiffraction:
         # Flatten to [batch_size, n_supercells, n_atoms, 3]
         avg_displacements_flat = avg_displacements.view(batch_size, -1, n_atoms, 3)
 
+        # Convert displacements from crystal fractional coordinates to Cartesian lab frame
+        avg_displacements_flat = torch.matmul(avg_displacements_flat, self.crystal.lattice_vectors)
+
         # Determine batch size
         if q_batch_size is None:
             q_batch_size = n_pixels
