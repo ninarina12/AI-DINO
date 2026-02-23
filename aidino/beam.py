@@ -396,9 +396,9 @@ class Beam:
         ax3d.legend(loc='upper left', frameon=False)
     
         format_axis(ax3d)
-        ax3d.set_xlabel('lab y (nm)', fontproperties=props, labelpad=4)
-        ax3d.set_ylabel('lab z (nm)', fontproperties=props, labelpad=4)
-        ax3d.set_zlabel('lab x (nm)', fontproperties=props, labelpad=4)
+        ax3d.set_xlabel('y (nm)', fontproperties=props, labelpad=4)
+        ax3d.set_ylabel('z (nm)', fontproperties=props, labelpad=4)
+        ax3d.set_zlabel('x (nm)', fontproperties=props, labelpad=4)
         x_label_props = ax3d.get_xticklabels()[0].get_font_properties()
         for label in ax3d.get_zticklabels():
             label.set_font_properties(x_label_props)
@@ -429,9 +429,9 @@ class Beam:
             ax3d.get_ylim()[0] + ax_len * 0.3,   # lab_z
         ])
         for vec, lbl, col in [
-            (np.array([1,0,0]), 'lab x',       cm.managua(70)),
-            (np.array([0,1,0]), '      lab y', cm.managua(30)),
-            (np.array([0,0,1]), '   lab z',    cm.managua(200)),
+            (np.array([1,0,0]), 'x',      cm.managua(70)),
+            (np.array([0,1,0]), '     y', cm.managua(30)),
+            (np.array([0,0,1]), '   z',   cm.managua(200)),
         ]:
             ax3d.quiver(*to_mpl(*origin_nm), *to_mpl(*(vec*ax_len)),
                         color=col, linewidth=1.5, arrow_length_ratio=0.3)
