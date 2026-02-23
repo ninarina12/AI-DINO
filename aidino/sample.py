@@ -147,34 +147,6 @@ class Crystal:
                 
                 self.f_prime[:,i] = torch.tensor(f_prime, dtype=self.dtype, device=self.device)
                 self.f_double_prime[:,i] = torch.tensor(f_double_prime, dtype=self.dtype, device=self.device)
-    
-    def calculate_form_factors(self, q_magnitude: Tensor) -> Tensor:
-        """
-        Calculate the approximate atomic form factors as a sum of gaussians for each atom over the given q values.
-        
-        Parameters:
-        -----------
-        q_magnitude : torch.Tensor
-            q vector magnitude as a tensor of shape [batch_size, 1]
-
-        Returns:
-        --------
-        torch.Tensor:
-            Approximated form factor amplitudes of shape [batch_size, n_atoms]
-        """
-        # Calculate f0(q) = Σ[ai * exp(-bi * s²)] + c
-        s_squared = (q_magnitude / (4 * torch.pi)) ** 2
-        
-        gaussian_terms = self.coeff_a.view(1,-1) * torch.exp(-self.coeff_b.view(1,-1) * s_squared)
-        f0 = gaussian_terms.view(-1, self.n_atoms, 4).sum(dim=-1) + self.coeff_c
-        
-        if self.include_anomalous:
-            # f(q,E) = f0(q) + f'(E) + i*f''(E)
-            f_real = f0 + self.f_prime
-            f_imag = self.f_double_prime
-            return torch.complex(f_real, f_imag)
-        else:
-            return f0
 
     @property
     def position(self) -> Tensor:
@@ -313,45 +285,7 @@ class Crystal:
         
         view.zoomTo()
         view.show()
-
-    def get_penetration_depth(self, wavelength: Optional[float] = None) -> float:
-        """
-        Calculate linear attenuation coefficient and penetration depth.
-        Uses NIST XCOM data via xraydb. Works for any energy from ~1 keV to 1 MeV.
-        
-        Parameters
-        ----------
-        wavelength: float
-                Wavelength in meters.
-        
-        Returns
-        -------
-        penetration_depth : float
-            1/e penetration depth in meters
-        """
-    
-        if wavelength is None:
-            if self.wavelength is not None:
-                wavelength = self.wavelength
-            else:
-                raise TypeError("The X-ray wavelength must be provided.")
-                    
-        # Use xraydb's material_mu which handles formula strings
-        # material_mu returns mu in 1/cm when density is provided
-        mu_cm = xraydb.material_mu(
-            self.structure.formula,
-            wavelength_to_energy(self.wavelength),
-            density=self.structure.density
-        )
-        
-        # Convert to m^-1
-        mu = mu_cm * 100
-        
-        # Calculate penetration depth (1/e depth)
-        penetration_depth = 1.0 / mu
-        
-        return penetration_depth
-    
+            
     def get_xrd_pattern(self, wavelength: Optional[float] = None):
         """
         Calculate the XRD pattern of the structure at the given wavelength.
@@ -525,6 +459,132 @@ class Crystal:
         transformation = RotationTransformation(rotation_axis, rotation_angle, angle_in_radians=False)
         self.structure = transformation.apply_transformation(self.structure)
 
+    def calculate_form_factors(self, q_magnitude: Tensor) -> Tensor:
+        """
+        Calculate the approximate atomic form factors as a sum of gaussians for each atom over the given q values.
+        
+        Parameters:
+        -----------
+        q_magnitude : torch.Tensor
+            q vector magnitude as a tensor of shape [batch_size, 1]
+
+        Returns:
+        --------
+        torch.Tensor:
+            Approximated form factor amplitudes of shape [batch_size, n_atoms]
+        """
+        # Calculate f0(q) = Σ[ai * exp(-bi * s²)] + c
+        s_squared = (q_magnitude / (4 * torch.pi)) ** 2
+        
+        gaussian_terms = self.coeff_a.view(1,-1) * torch.exp(-self.coeff_b.view(1,-1) * s_squared)
+        f0 = gaussian_terms.view(-1, self.n_atoms, 4).sum(dim=-1) + self.coeff_c
+        
+        if self.include_anomalous:
+            # f(q,E) = f0(q) + f'(E) + i*f''(E)
+            f_real = f0 + self.f_prime
+            f_imag = self.f_double_prime
+            return torch.complex(f_real, f_imag)
+        else:
+            return f0
+            
+    def get_penetration_depth(self, wavelength: Optional[float] = None) -> float:
+        """
+        Calculate linear attenuation coefficient and penetration depth.
+        Uses NIST XCOM data via xraydb. Works for any energy from ~1 keV to 1 MeV.
+        
+        Parameters
+        ----------
+        wavelength: float
+                Wavelength in meters.
+        
+        Returns
+        -------
+        penetration_depth : float
+            1/e penetration depth in meters
+        """
+    
+        if wavelength is None:
+            if self.wavelength is not None:
+                wavelength = self.wavelength
+            else:
+                raise TypeError("The X-ray wavelength must be provided.")
+                    
+        # Use xraydb's material_mu which handles formula strings
+        # material_mu returns mu in 1/cm when density is provided
+        mu_cm = xraydb.material_mu(
+            self.structure.formula,
+            wavelength_to_energy(self.wavelength),
+            density=self.structure.density
+        )
+        
+        # Convert to m^-1
+        mu = mu_cm * 100
+        
+        # Calculate penetration depth (1/e depth)
+        penetration_depth = 1.0 / mu
+        
+        return penetration_depth
+
+    def create_displacement_field(self, batch_size=1, supercell_size=(1,1,1), scaling_factor=1., displacement_dict=None):
+        """
+        Generate a displacement field for atoms in a crystal structure.
+    
+        Creates either a deterministic displacement field from a provided dictionary,
+        or a random displacement field scaled by a given factor.
+    
+        Parameters
+        ----------
+        batch_size : int, optional
+            Number of displacement fields to generate in the batch. Default is 1.
+        supercell_size : tuple of int, optional
+            Size of the supercell in each dimension (x, y, z). The crystal size is
+            divided by this value per axis to determine the field shape. Default is (1, 1, 1).
+        scaling_factor : float, optional
+            Scaling factor applied to the random displacement field. Controls the
+            maximum magnitude of random displacements. Only used when
+            `displacement_dict` is None. Default is 1.0.
+        displacement_dict : dict or None, optional
+            Dictionary mapping element symbols (str) to displacement vectors. If
+            provided, each atom type listed in the dictionary is assigned its
+            corresponding fixed displacement vector, and all other atoms receive
+            zero displacement. If None, displacements are drawn randomly from a
+            uniform distribution on [-scaling_factor, scaling_factor]. Default is None.
+    
+        Returns
+        -------
+        torch.Tensor
+            Displacement field tensor of shape:
+            ``(batch_size, crystal_x, crystal_y, crystal_z, *atom_positions.shape)``
+            where ``crystal_k = self.crystal_size[k] // supercell_size[k]``.
+            The tensor uses ``self.dtype`` and is located on ``self.device``.
+        """
+    
+        if displacement_dict is not None:
+            # Initialize the displacement field to zero for all atoms
+            displacement_field = torch.zeros(
+                (batch_size,) + tuple([self.crystal_size[k] // supercell_size[k] for k in range(3)]) +
+                self.atom_positions.shape,
+                dtype=self.dtype,
+                device=self.device
+            )
+    
+            # Assign each element its specified displacement vector
+            for element, displacement in displacement_dict.items():
+                displacement_field[..., self.atom_types.index(element), :] = displacement
+    
+        else:
+            # Generate a random displacement field uniform in [-1, 1], then scale it
+            displacement_field = scaling_factor * (
+                2 * torch.rand(
+                    (batch_size,) + tuple([self.crystal_size[k] // supercell_size[k] for k in range(3)]) +
+                    self.atom_positions.shape,
+                    dtype=self.dtype,
+                    device=self.device
+                ) - 1
+            )
+    
+        return displacement_field
+        
     def create_spherical_mask(
         self,
         center: Optional[Tuple[float, float, float]] = None,
