@@ -165,6 +165,11 @@ class Crystal:
         return torch.tensor(self.structure.lattice.matrix * 1e-10, dtype=self.dtype, device=self.device)
 
     @property
+    def original_lattice_vectors(self) -> Tensor:
+        source = getattr(self, 'original_structure', self.structure)
+        return torch.tensor(source.lattice.matrix * 1e-10, dtype=self.dtype, device=self.device)
+    
+    @property
     def atom_positions(self) -> Tensor:
         return torch.tensor(self.structure.cart_coords * 1e-10, dtype=self.dtype, device=self.device)
 
@@ -454,7 +459,11 @@ class Crystal:
         }
 
         rotation_axis = rotation_axis_directions[rotation_axis]
-        
+
+        # Save the original structure
+        if not hasattr(self, 'original_structure'):
+            self.original_structure = self.structure.copy()
+            
         # Apply rotation transformation
         transformation = RotationTransformation(rotation_axis, rotation_angle, angle_in_radians=False)
         self.structure = transformation.apply_transformation(self.structure)
