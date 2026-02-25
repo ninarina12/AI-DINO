@@ -2,6 +2,7 @@ ase==3.24.0
 cmcrameri==1.9
 einops==0.8.1
 matplotlib==3.10.1
+netcdf4==1.7.4
 networkx==3.3
 notebook==7.3.2
 numpy==2.1.2
