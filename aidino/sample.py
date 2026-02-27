@@ -56,7 +56,7 @@ class Crystal:
         """
 
         self.cif_path = cif_path
-        self.crystal_size = tuple(crystal_size)
+        self._crystal_size = tuple(crystal_size)
         self.wavelength = wavelength
         self.dtype = dtype
         self.device = device
@@ -73,6 +73,9 @@ class Crystal:
         
         # Parse cif file
         self._parse_cif_file()
+
+        # Rotation matrix tracking: cumulative rotation from original to current orientation
+        self._rotation_matrix = torch.eye(3, dtype=self.dtype, device=self.device)
         
         # Parse atom types
         try:
@@ -87,6 +90,9 @@ class Crystal:
 
         # Set global position (default is origin)
         self._position = torch.zeros(3, dtype=self.dtype, device=self.device)
+
+        # Print crystal size
+        self.print_size()
 
     def _parse_cif_file(self):
         """
@@ -148,6 +154,22 @@ class Crystal:
                 self.f_prime[:,i] = torch.tensor(f_prime, dtype=self.dtype, device=self.device)
                 self.f_double_prime[:,i] = torch.tensor(f_double_prime, dtype=self.dtype, device=self.device)
 
+    def _update_rotation_matrix(self):
+        """
+        Recompute _rotation_matrix from the ratio of current to original lattice matrices.
+        Called internally after any rotation is applied.
+        R is defined such that: L_curr = L_orig @ R.T  →  R = (L_orig^{-T} @ L_curr^T).T
+        """
+        L_orig = torch.tensor(
+            self.original_structure.lattice.matrix, dtype=torch.float64
+        )
+        L_curr = torch.tensor(
+            self.structure.lattice.matrix, dtype=torch.float64
+        )
+        # Solve L_orig @ R.T = L_curr  →  R.T = L_orig^{-1} @ L_curr
+        R = torch.linalg.solve(L_orig, L_curr).T
+        self._rotation_matrix = R.to(dtype=self.dtype, device=self.device)
+
     @property
     def position(self) -> Tensor:
         return self._position
@@ -159,7 +181,18 @@ class Crystal:
     @position.deleter
     def position(self):
         del self._position
+
+    @property
+    def crystal_size(self) -> tuple:
+        return self._crystal_size
     
+    @crystal_size.setter
+    def crystal_size(self, value):
+        self._crystal_size = tuple(value)
+        # Only print if lattice vectors are available
+        if hasattr(self, 'structure'):
+            self.print_size()
+        
     @property
     def lattice_vectors(self) -> Tensor:
         return torch.tensor(self.structure.lattice.matrix * 1e-10, dtype=self.dtype, device=self.device)
@@ -168,7 +201,16 @@ class Crystal:
     def original_lattice_vectors(self) -> Tensor:
         source = getattr(self, 'original_structure', self.structure)
         return torch.tensor(source.lattice.matrix * 1e-10, dtype=self.dtype, device=self.device)
-    
+
+    @property
+    def rotation_matrix(self) -> Tensor:
+        """
+        Cumulative rotation matrix R from original to current crystal orientation,
+        such that L_current = R @ L_original (row-vector convention: L_current = L_original @ R.T).
+        Identity if no rotation has been applied.
+        """
+        return self._rotation_matrix
+        
     @property
     def atom_positions(self) -> Tensor:
         return torch.tensor(self.structure.cart_coords * 1e-10, dtype=self.dtype, device=self.device)
@@ -188,7 +230,13 @@ class Crystal:
     @property
     def crystal_volume(self) -> float:
         return self.cell_volume * self.n_cells
-
+    
+    def print_size(self):
+        """Print the physical dimensions of the crystal in nanometers."""
+        L = self.original_lattice_vectors.cpu().numpy()  # [3, 3], meters
+        dims_nm = np.linalg.norm(L, axis=1) * np.array(self.crystal_size) / 1e-9
+        print(f"Crystal size: {dims_nm[0]:.1f} nm x {dims_nm[1]:.1f} nm x {dims_nm[2]:.1f} nm")
+    
     @staticmethod
     def structure_to_xyz(structure):
         """
@@ -421,6 +469,7 @@ class Crystal:
             if np.dot(miller_normal, target_direction) > 0:
                 # Already aligned, no rotation needed
                 self.structure = structure
+                self._update_rotation_matrix()
                 return
             else:
                 # Anti-aligned, need 180° rotation
@@ -438,6 +487,7 @@ class Crystal:
         rotated_structure = transformation.apply_transformation(structure)
 
         self.structure = rotated_structure
+        self._update_rotation_matrix()
 
     def misalign_about_axis(self, rotation_angle=0., rotation_axis='y'):
         """
@@ -467,6 +517,7 @@ class Crystal:
         # Apply rotation transformation
         transformation = RotationTransformation(rotation_axis, rotation_angle, angle_in_radians=False)
         self.structure = transformation.apply_transformation(self.structure)
+        self._update_rotation_matrix()
 
     def calculate_form_factors(self, q_magnitude: Tensor) -> Tensor:
         """

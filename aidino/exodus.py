@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -226,7 +225,7 @@ class ExodusMesh:
         Reshape a flat nodal field [T, N] → [T', nx, ny, nz].
 
         ``ts`` is applied before the reshape so only the selected timesteps
-        are ever materialised in memory.
+        are ever materialized in memory.
         """
         nx, ny, nz = len(xs), len(ys), len(zs)
         ix, iy, iz = self._build_node_index(xs, ys, zs)
@@ -247,25 +246,25 @@ class ExodusMesh:
     ) -> np.ndarray:
         """
         Reshape element-level fields into a volume [T', nx-1, ny-1, nz-1].
-
+    
         ``ts`` is applied before the reshape so only the selected timesteps
         are materialised in memory. Assumes HEX8: centroid = mean of 8 nodes.
         """
         nx, ny, nz = len(xs) - 1, len(ys) - 1, len(zs) - 1
         T_out = next(iter(field_by_block.values()))[ts].shape[0]
-
-        volume = np.zeros((T_out, nx, ny, nz), dtype=np.float32)
-
+    
+        volume = np.zeros((T_out, nx, ny, nz), dtype=next(iter(field_by_block.values())).dtype)
+    
+        if not hasattr(self, '_elem_index_cache'):
+            self._elem_index_cache = {}
+    
         for block in self.element_blocks:
             if block.block_id not in field_by_block:
                 continue
             sliced = field_by_block[block.block_id][ts]  # [T', E]
             conn   = block.connectivity                   # [E, nodes_per_elem]
-
-            # Centroid indices — cached per block
+    
             cache_key = f'_elem_idx_{block.block_id}_{len(xs)}'
-            if not hasattr(self, '_elem_index_cache'):
-                self._elem_index_cache = {}
             if cache_key not in self._elem_index_cache:
                 node_coords = self.coords[conn]
                 centroids   = node_coords.mean(axis=1)
@@ -274,9 +273,9 @@ class ExodusMesh:
                 ez = np.clip(np.searchsorted(zs[:-1], centroids[:, 2], side='right') - 1, 0, nz-1)
                 self._elem_index_cache[cache_key] = (ex, ey, ez)
             ex, ey, ez = self._elem_index_cache[cache_key]
-
+    
             volume[:, ex, ey, ez] = sliced
-
+    
         return volume
 
     def resample_to_crystal_grid(
@@ -288,6 +287,7 @@ class ExodusMesh:
         polar_names: tuple[str, str, str] = ('polar_x', 'polar_y', 'polar_z'),
         strain_names: tuple[str, ...] = ('e00', 'e01', 'e02', 'e11', 'e12', 'e22'),
         coord_scale: float = 1e-9,
+        anchor: Optional[tuple[float, float, float]] = None,
         device: str = 'cpu',
         dtype: 'torch.dtype' = None,
     ) -> 'CrystalGrid':
@@ -321,6 +321,13 @@ class ExodusMesh:
             Use 1e-10 for Angstroms, or 1.0 if already in meters.
             Applied to bounding-box coordinates and to continuum_displacement values.
             Strain (dimensionless) and polarization (C/m²) are not rescaled.
+        anchor : tuple of float, optional
+            Position in exodus coordinates (same units as coord_scale, i.e. nanometers
+            by default) of the crystal grid's origin — the point in the simulation box
+            that corresponds to fractional position (0, 0, 0) of the crystal.
+            If None, the crystal grid is centered within the simulation box.
+            Only used when the crystal grid is smaller than the simulation box.
+            Ignored (with a printed notice) when the crystal is cropped to fit the box.
         device : str
             Torch device for output tensors.
         dtype : torch.dtype, optional
@@ -354,11 +361,67 @@ class ExodusMesh:
         nx, ny, nz = len(xs), len(ys), len(zs)
 
         # ── 2. resolve supercell grid dimensions ──────────────────────────
-        d1, d2, d3          = supercell_size
-        n1, n2, n3          = crystal.crystal_size
+        d1, d2, d3 = supercell_size
+        n1, n2, n3 = crystal.crystal_size
+
+        # ── 3. compute lattice and bounding box ───────────────────────────
+        L = crystal.original_lattice_vectors.to(dtype=_f64, device='cpu')
+
+        box_min  = torch.tensor([xs.min(), ys.min(), zs.min()], dtype=_f64) * coord_scale
+        box_max  = torch.tensor([xs.max(), ys.max(), zs.max()], dtype=_f64) * coord_scale
+        box_span = box_max - box_min
+
+        # ── 4. crop if crystal exceeds box, then resolve anchor ───────────
+        lat_params   = torch.linalg.norm(L, dim=1)                      # [3]
+        max_cells    = (box_span / lat_params).floor().to(torch.int64)   # [3]
+        n1_orig, n2_orig, n3_orig = n1, n2, n3
+
+        if torch.any(torch.tensor([n1, n2, n3], dtype=torch.int64) > max_cells):
+            n1_new = int((min(n1, int(max_cells[0])) // d1) * d1)
+            n2_new = int((min(n2, int(max_cells[1])) // d2) * d2)
+            n3_new = int((min(n3, int(max_cells[2])) // d3) * d3)
+            print(
+                f"Crystal size ({n1}, {n2}, {n3}) exceeds simulation box along one or more "
+                f"axes. Cropping to ({n1_new}, {n2_new}, {n3_new}) unit cells to fit."
+            )
+            n1, n2, n3 = n1_new, n2_new, n3_new
+            crystal.crystal_size = (n1, n2, n3)
+        elif torch.all(torch.tensor([n1, n2, n3], dtype=torch.int64) < max_cells):
+            print(
+                f"Crystal size ({n1}, {n2}, {n3}) is smaller than the simulation box. "
+                f"Aligning top corner of crystal with top corner of simulation box. "
+                f"To override, pass an explicit anchor in exodus coordinates "
+                f"({coord_scale:.0e} m units)."
+            )
+
+        # crystal_span always computed after n1/n2/n3 are finalised
+        crystal_extent = torch.tensor([n1, n2, n3], dtype=_f64).unsqueeze(0) * L
+        crystal_span   = crystal_extent.sum(dim=0)  # [3] Cartesian extent
+
+        if anchor is None:
+            anchor_m = box_max - crystal_span
+        else:
+            anchor_m = torch.tensor(anchor, dtype=_f64) * coord_scale
+            # On axes that were cropped, override the user anchor with top-corner alignment
+            cropped_axes = torch.tensor(
+                [n1 < n1_orig, n2 < n2_orig, n3 < n3_orig]
+            )
+            if torch.any(cropped_axes):
+                top_anchor = box_max - crystal_span
+                for ax in range(3):
+                    if cropped_axes[ax]:
+                        anchor_m[ax] = top_anchor[ax]
+                        print(f"  (anchor overridden on axis {ax} — crystal was cropped on that axis)")
+            anchor_max = anchor_m + crystal_span
+            if torch.any(anchor_m < box_min) or torch.any(anchor_max > box_max):
+                print(
+                    f"Warning: anchor places the crystal grid partially outside the "
+                    f"simulation box. Out-of-bounds supercells will sample the nearest "
+                    f"in-box value (padding_mode='border')."
+                )
+
         n_sc1, n_sc2, n_sc3 = n1 // d1, n2 // d2, n3 // d3
 
-        # ── 3. compute supercell center positions in lab frame (meters) ────
         i_frac = (torch.arange(n_sc1, dtype=_f64) + 0.5) * d1
         j_frac = (torch.arange(n_sc2, dtype=_f64) + 0.5) * d2
         k_frac = (torch.arange(n_sc3, dtype=_f64) + 0.5) * d3
@@ -366,20 +429,13 @@ class ExodusMesh:
         ii, jj, kk = torch.meshgrid(i_frac, j_frac, k_frac, indexing='ij')
         sc_indices  = torch.stack([ii, jj, kk], dim=-1)  # [n_sc1, n_sc2, n_sc3, 3]
 
-        # lattice vectors are in meters
-        L            = crystal.original_lattice_vectors.to(dtype=_f64, device='cpu')
-        sc_positions = torch.matmul(sc_indices, L)  # [n_sc1, n_sc2, n_sc3, 3] meters
-
-        # ── 4. normalise to [-1, 1] in the exodus bounding box ────────────
-        # coord_scale brings the exodus bounding box into meters to match sc_positions
-        box_min  = torch.tensor([xs.min(), ys.min(), zs.min()], dtype=_f64) * coord_scale
-        box_max  = torch.tensor([xs.max(), ys.max(), zs.max()], dtype=_f64) * coord_scale
-        box_span = box_max - box_min
+        # Cartesian positions relative to crystal origin, then shifted by anchor
+        sc_positions = torch.matmul(sc_indices, L) + anchor_m  # [n_sc1, n_sc2, n_sc3, 3]
 
         # grid_sample expects coords in (z, y, x) order normalised to [-1, 1]
-        sc_norm = 2.0 * (sc_positions - box_min) / box_span - 1.0  # [..., 3] (x,y,z)
-        sc_grid = sc_norm[..., [2, 1, 0]]                           # reorder to (z,y,x)
-        grid_5d = sc_grid.unsqueeze(0)                              # [1, n_sc1, n_sc2, n_sc3, 3]
+        sc_norm = 2.0 * (sc_positions - box_min) / box_span - 1.0
+        sc_grid = sc_norm[..., [2, 1, 0]]
+        grid_5d = sc_grid.unsqueeze(0)
 
         # Pre-cast the sampling grid to float32 once (shared across all fields)
         grid_5d_f32 = grid_5d.to(torch.float32)
@@ -431,7 +487,7 @@ class ExodusMesh:
 
         # ── 7. resample strain tensor → lattice perturbation ─────────────
         # Strain is dimensionless — coord_scale does not apply to the values
-        lattice_perturbation = None
+        lattice_strain = None
         voigt_to_ij = [(0,0),(0,1),(0,2),(1,1),(1,2),(2,2)]
         strain_vols: dict = {}
 
@@ -439,7 +495,7 @@ class ExodusMesh:
             if name in self.element_vars:
                 vol = self._element_field_to_volume(self.element_vars[name], xs, ys, zs, ts)
                 # Element variables live on an (nx-1)×(ny-1)×(nz-1) centroid grid;
-                # build a separate normalised coordinate system for that grid.
+                # build a separate normalized coordinate system for that grid.
                 xs_e = 0.5 * (xs[:-1] + xs[1:])
                 ys_e = 0.5 * (ys[:-1] + ys[1:])
                 zs_e = 0.5 * (zs[:-1] + zs[1:])
@@ -469,20 +525,37 @@ class ExodusMesh:
             eps   = torch.zeros(T_out, n_sc1, n_sc2, n_sc3, 3, 3, dtype=dtype, device=device)
             for (i, j), val in strain_vols.items():
                 eps[..., i, j] = val
-                eps[..., j, i] = val  # symmetrise off-diagonal
+                eps[..., j, i] = val  # symmetrize off-diagonal
 
             # δL = ε @ L_0  (strain dimensionless, L_0 in meters)
             L0 = crystal.original_lattice_vectors.to(dtype=dtype, device=device)
-            lattice_perturbation = torch.matmul(
+            lattice_strain = torch.matmul(
                 eps, L0.unsqueeze(0).unsqueeze(0).unsqueeze(0)
             )
 
+        # ── 8. rotate fields from original structure frame to current lab frame ──
+        # continuum_displacement and lattice_strain are expressed in the exodus
+        # simulation frame, which is aligned with the original (unrotated) crystal.
+        # crystal.rotation_matrix R satisfies L_curr = L_orig @ R.T, so vectors
+        # and lattice matrices transform by the same right-multiplication by R.T.
+        R = crystal.rotation_matrix.to(dtype=dtype, device=device)  # [3, 3]
+
+        if continuum_displacement is not None:
+            # u has shape [T, n_sc1, n_sc2, n_sc3, 3] — rotate each 3-vector
+            continuum_displacement = continuum_displacement @ R.T
+
+        if lattice_strain is not None:
+            # lattice_strain has shape [T, n_sc1, n_sc2, n_sc3, 3, 3]
+            # each δL matrix transforms as δL_rotated = δL @ R.T
+            lattice_strain = lattice_strain @ R.T
+            
         return CrystalGrid(
             continuum_displacement=continuum_displacement,
             polarization=polarization,
-            lattice_perturbation=lattice_perturbation,
+            lattice_strain=lattice_strain,
             supercell_size=supercell_size,
             crystal_size=crystal.crystal_size,
+            rotation_applied=R,
             times=torch.tensor(
                 self.times[ts] if self.times is not None else [],
                 dtype=dtype, device=device,
@@ -510,20 +583,22 @@ class CrystalGrid:
         Polarization per supercell (C/m²). Convert via Born effective charges
         to get ``sublattice_displacements`` for diffraction methods.
 
-    lattice_perturbation : Tensor | None
+    lattice_strain : Tensor | None
         Shape [T, n_sc1, n_sc2, n_sc3, 3, 3].
-        Additive perturbation to L_0: L_local = L_0 + lattice_perturbation.
+        Additive perturbation to L_0: L_local = L_0 + lattice_strain.
         Derived from strain tensor via delta_L = eps @ L_0.
 
-    supercell_size : tuple of int
-    crystal_size   : tuple of int
-    times          : Tensor — time values for selected steps.
+    supercell_size   : tuple of int
+    crystal_size     : tuple of int
+    rotation_applied : Tensor — R that was applied during resampling
+    times            : Tensor — time values for selected steps.
     """
     continuum_displacement: Optional['torch.Tensor']
     polarization:           Optional['torch.Tensor']
-    lattice_perturbation:   Optional['torch.Tensor']
+    lattice_strain:         Optional['torch.Tensor']
     supercell_size:         tuple
     crystal_size:           tuple
+    rotation_applied:       'torch.Tensor'
     times:                  'torch.Tensor'
 
     @property
@@ -536,15 +611,35 @@ class CrystalGrid:
         d1, d2, d3 = self.supercell_size
         return (n1 // d1, n2 // d2, n3 // d3)
 
+    def reorient(self, crystal):
+        """
+        Re-apply rotation for a newly rotated crystal without reloading the mesh.
+        Undoes the previously applied rotation and applies the current one.
+        """
+        R_old = self.rotation_applied                             # [3, 3]
+        R_new = crystal.rotation_matrix.to(
+            dtype=R_old.dtype, device=R_old.device)               # [3, 3]
+        # Combined transform: undo old R, apply new R
+        # For a vector: v_new = v_orig @ R_new.T = v_rotated_old @ R_old @ R_new.T
+        R_update = R_old @ R_new.T                                # [3, 3]
+    
+        if self.continuum_displacement is not None:
+            self.continuum_displacement = self.continuum_displacement @ R_update
+    
+        if self.lattice_strain is not None:
+            self.lattice_strain = self.lattice_strain @ R_update
+    
+        self.rotation_applied = R_new
+    
     def __repr__(self) -> str:
         n_sc1, n_sc2, n_sc3 = self.grid_shape
         lines = [
             "CrystalGrid(",
-            f"  supercell grid : {n_sc1} x {n_sc2} x {n_sc3}",
-            f"  time steps     : {self.n_time_steps}",
-            f"  continuum_disp : {'yes' if self.continuum_displacement is not None else 'missing'}",
-            f"  polarization   : {'yes' if self.polarization is not None else 'missing'}",
-            f"  lattice_perturb: {'yes' if self.lattice_perturbation is not None else 'missing'}",
+            f"  supercell grid         : {n_sc1} x {n_sc2} x {n_sc3}",
+            f"  time steps             : {self.n_time_steps}",
+            f"  continuum_displacement : {'yes' if self.continuum_displacement is not None else 'missing'}",
+            f"  polarization           : {'yes' if self.polarization is not None else 'missing'}",
+            f"  lattice_strain         : {'yes' if self.lattice_strain is not None else 'missing'}",
             ")",
         ]
         return "\n".join(lines)
@@ -787,21 +882,13 @@ class ExodusParser:
         }
         var_names = list(result.keys())
         for i, vname in enumerate(var_names):
-            for blk in blocks:
-                key = f"vals_elem_var{i + 1}eb{blk.block_id}"
-                # also try sequential block index
-                if key not in nc.variables:
-                    # find positional index of this block
-                    pos = next(
-                        (j + 1 for j, b in enumerate(blocks) if b.block_id == blk.block_id),
-                        None,
-                    )
-                    if pos is not None:
-                        key = f"vals_elem_var{i + 1}eb{pos}"
+            for j, blk in enumerate(blocks):
+                # eb index is always positional (j+1), never block_id
+                key = f"vals_elem_var{i + 1}eb{j + 1}"
                 if key in nc.variables:
                     result[vname][blk.block_id] = np.asarray(
                         nc.variables[key][:], dtype=np.float64
-                    )  # shape (T, num_elem_in_block)
+                    )
         return result
 
     def _qa_records(self, nc) -> list[tuple]:
