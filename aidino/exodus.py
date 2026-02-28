@@ -388,7 +388,8 @@ class ExodusMesh:
             crystal.crystal_size = (n1, n2, n3)
         elif torch.all(torch.tensor([n1, n2, n3], dtype=torch.int64) < max_cells):
             print(
-                f"Crystal size ({n1}, {n2}, {n3}) is smaller than the simulation box. "
+                f"Crystal size ({n1}, {n2}, {n3}) is {(1 - (n1 * n2 * n3) / torch.prod(max_cells)) * 100:.1f} % "
+                f"smaller than the simulation box. "
                 f"Aligning top corner of crystal with top corner of simulation box. "
                 f"To override, pass an explicit anchor in exodus coordinates "
                 f"({coord_scale:.0e} m units)."
